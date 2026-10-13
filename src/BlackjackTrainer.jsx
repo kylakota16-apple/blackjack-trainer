@@ -274,12 +274,39 @@ function playerValuesForCell(tableKey, row) {
   return pickOne(combos);
 }
 
-function dealCell(cellStats, avoidKey) {
-  const seen = (c) => (cellStats[c.key] ? cellStats[c.key].attempts : 0);
-  const min = Math.min(...ALL_CELLS.map(seen));
-  let pool = ALL_CELLS.filter((c) => seen(c) === min && c.key !== avoidKey);
-  if (pool.length === 0) pool = ALL_CELLS.filter((c) => seen(c) === min);
-  const cell = pickOne(pool);
+// a spot counts as "weak" until you're getting at least 80% of it right
+const WEAK_BELOW = 0.8;
+function isWeakStat(stat) {
+  return !!stat && stat.attempts > 0 && stat.correct / stat.attempts < WEAK_BELOW;
+}
+
+function dealCell(cellStats, avoidKey, weakOnly = false) {
+  let cell = null;
+  if (weakOnly) {
+    const weak = ALL_CELLS.filter((c) => isWeakStat(cellStats[c.key]));
+    if (weak.length > 0) {
+      let pool = weak.filter((c) => c.key !== avoidKey);
+      if (pool.length === 0) pool = weak;
+      // worse spots come up more often
+      const weights = pool.map((c) => {
+        const st = cellStats[c.key];
+        return Math.max(0.2, 1 - st.correct / st.attempts);
+      });
+      let r = Math.random() * weights.reduce((a, b) => a + b, 0);
+      cell = pool[pool.length - 1];
+      for (let i = 0; i < pool.length; i++) {
+        r -= weights[i];
+        if (r <= 0) { cell = pool[i]; break; }
+      }
+    }
+  }
+  if (!cell) {
+    const seen = (c) => (cellStats[c.key] ? cellStats[c.key].attempts : 0);
+    const min = Math.min(...ALL_CELLS.map(seen));
+    let pool = ALL_CELLS.filter((c) => seen(c) === min && c.key !== avoidKey);
+    if (pool.length === 0) pool = ALL_CELLS.filter((c) => seen(c) === min);
+    cell = pickOne(pool);
+  }
 
   const [a, b] = playerValuesForCell(cell.table, cell.row);
   const playerCards = Math.random() < 0.5 ? [makeCard(a), makeCard(b)] : [makeCard(b), makeCard(a)];
@@ -443,6 +470,9 @@ export default function BlackjackTrainer() {
   const loadedRef = useRef(false);
   const cellStatsRef = useRef({});
   const lastCellRef = useRef(initialDeal.current.cellKey);
+  const [dealMode, setDealMode] = useState("full"); // "full" card or "weak" spots only
+  const dealModeRef = useRef("full");
+  dealModeRef.current = dealMode;
   cellStatsRef.current = cellStats;
 
   useEffect(() => {
@@ -456,6 +486,8 @@ export default function BlackjackTrainer() {
             if (parsed.stats) setStats(parsed.stats);
             if (parsed.cellStats) setCellStats(parsed.cellStats);
           }
+          const modeRes = await window.storage.get("deal-mode", false);
+          if (!cancelled && modeRes && modeRes.value === "weak") setDealMode("weak");
         }
       } catch (e) {
         // no saved session yet, or storage unavailable — start fresh
@@ -499,7 +531,7 @@ export default function BlackjackTrainer() {
   const correct = useMemo(() => correctAction(playerCards, dealerUp.rank), [playerCards, dealerUp]);
 
   const newHand = useCallback(() => {
-    const deal = dealCell(cellStatsRef.current, lastCellRef.current);
+    const deal = dealCell(cellStatsRef.current, lastCellRef.current, dealModeRef.current === "weak");
     lastCellRef.current = deal.cellKey;
     setPlayerCards(deal.playerCards);
     setDealerCards(deal.dealerCards);
@@ -554,6 +586,16 @@ export default function BlackjackTrainer() {
     if (isMilestone) triggerCelebration(newStreak);
   };
 
+  const chooseDealMode = (mode) => {
+    if (mode === dealModeRef.current) return;
+    dealModeRef.current = mode;
+    setDealMode(mode);
+    try {
+      if (window.storage && window.storage.set) window.storage.set("deal-mode", mode, false).catch(() => {});
+    } catch (e) { /* storage unavailable */ }
+    newHand();
+  };
+
   const resetHeatmap = () => {
     setCellStats({});
     saveSession(stats, {});
@@ -585,6 +627,11 @@ export default function BlackjackTrainer() {
     }
     return { seen, pass: min + 1 };
   }, [cellStats]);
+
+  const weakCount = useMemo(
+    () => ALL_CELLS.filter((c) => isWeakStat(cellStats[c.key])).length,
+    [cellStats]
+  );
 
   const weakestCell = useMemo(() => {
     let best = null;
@@ -698,8 +745,27 @@ export default function BlackjackTrainer() {
         <Stat label="BEST" value={stats.best} />
       </div>
 
+      <div style={styles.modeToggle}>
+        <button
+          style={{ ...styles.modeButton, ...(dealMode === "full" ? styles.modeButtonOn : null) }}
+          onClick={() => chooseDealMode("full")}
+        >
+          Full card
+        </button>
+        <button
+          style={{ ...styles.modeButton, ...(dealMode === "weak" ? styles.modeButtonOn : null) }}
+          onClick={() => chooseDealMode("weak")}
+        >
+          Weak spots{weakCount > 0 ? ` (${weakCount})` : ""}
+        </button>
+      </div>
+
       <div style={styles.coverage}>
-        Strategy card: {coverage.seen} of {TOTAL_CELLS} spots seen · pass {coverage.pass}
+        {dealMode === "weak"
+          ? weakCount > 0
+            ? `Drilling ${weakCount} weak spot${weakCount === 1 ? "" : "s"} · get one to 80% right and it drops off`
+            : "No weak spots right now, so you're getting the full card"
+          : `Strategy card: ${coverage.seen} of ${TOTAL_CELLS} spots seen · pass ${coverage.pass}`}
       </div>
 
       <button style={styles.summaryTrigger} onClick={() => setShowSummary(true)}>
@@ -1032,6 +1098,30 @@ const styles = {
   },
   subtitle: { fontSize: 12, color: "#8fae9d", marginTop: 6 },
   subtitleSmall: { fontSize: 10, color: "#5f7a6c", marginTop: 4, letterSpacing: "0.04em" },
+  modeToggle: {
+    display: "flex",
+    gap: 0,
+    marginBottom: 8,
+    zIndex: 1,
+    border: "1px solid rgba(242,234,214,0.25)",
+    borderRadius: 999,
+    overflow: "hidden",
+  },
+  modeButton: {
+    background: "rgba(0,0,0,0.25)",
+    color: "#8fae9d",
+    border: "none",
+    padding: "7px 16px",
+    fontSize: 12,
+    letterSpacing: "0.04em",
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  modeButtonOn: {
+    background: "#cba135",
+    color: "#1a1408",
+    fontWeight: 600,
+  },
   coverage: {
     fontSize: 11,
     color: "#8fae9d",
